@@ -175,13 +175,21 @@ public class SystemTextJsonSerializerSettings : SerializerSettings
         ArgumentNullException.ThrowIfNull(options);
 
         if (options.RespectNullableAnnotations)
+        {
             throw UnsupportedOption(nameof(options.RespectNullableAnnotations));
+        }
         if (options.RespectRequiredConstructorParameters)
+        {
             throw UnsupportedOption(nameof(options.RespectRequiredConstructorParameters));
+        }
         if (!options.AllowDuplicateProperties)
+        {
             throw UnsupportedOption(nameof(options.AllowDuplicateProperties));
+        }
         if (options.AllowOutOfOrderMetadataProperties)
+        {
             throw UnsupportedOption(nameof(options.AllowOutOfOrderMetadataProperties));
+        }
 
         var resolver = options.TypeInfoResolver;
         if (resolver != null &&
