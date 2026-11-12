@@ -5,6 +5,7 @@ using System;
 using System.Buffers;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Threading;
 
 namespace REDox.Serialization.SystemTextJson;
 
@@ -19,6 +20,47 @@ public sealed class JsonConverterAdapter : DataConverterFactory
     }
 
     public JsonConverter Converter { get; }
+
+    // Shared across converter types. Leases are exclusive, including during recursive
+    // converter calls; oversized buffers are discarded rather than retained in the pool.
+    private sealed class Bridge
+    {
+        private static readonly Bridge?[] s_pool = new Bridge?[16];
+        public readonly ArrayBufferWriter<byte> Buffer = new(256);
+        public readonly Utf8JsonWriter Writer;
+
+        private Bridge() => Writer = new Utf8JsonWriter(Buffer);
+
+        public static Bridge Rent()
+        {
+            for (var i = 0; i < s_pool.Length; i++)
+            {
+                var bridge = Interlocked.Exchange(ref s_pool[i], null);
+                if (bridge != null)
+                {
+                    return bridge;
+                }
+            }
+            return new Bridge();
+        }
+
+        public void Return()
+        {
+            Writer.Reset(Buffer);
+            Buffer.Clear();
+            if (Buffer.Capacity <= 64 * 1024)
+            {
+                for (var i = 0; i < s_pool.Length; i++)
+                {
+                    if (Interlocked.CompareExchange(ref s_pool[i], this, null) == null)
+                    {
+                        return;
+                    }
+                }
+            }
+            Writer.Dispose();
+        }
+    }
 
     public override bool CanConvert(Type type)
     {
@@ -59,29 +101,34 @@ public sealed class JsonConverterAdapter : DataConverterFactory
         public override T ReadAsPropertyName(in DataReader reader, uint tokenId)
         {
             var propertyName = reader.ReadString(tokenId);
-            var buffer = new ArrayBufferWriter<byte>();
-
-            using (var utf8Writer = new Utf8JsonWriter(buffer))
+            var bridge = Bridge.Rent();
+            try
             {
+                var utf8Writer = bridge.Writer;
                 utf8Writer.WriteStartObject();
                 utf8Writer.WritePropertyName(propertyName);
                 utf8Writer.WriteNullValue();
                 utf8Writer.WriteEndObject();
+                utf8Writer.Flush();
+
+                var utf8Reader = new Utf8JsonReader(bridge.Buffer.WrittenSpan);
+
+                if (!utf8Reader.Read() || utf8Reader.TokenType != JsonTokenType.StartObject)
+                {
+                    throw new JsonException();
+                }
+
+                if (!utf8Reader.Read() || utf8Reader.TokenType != JsonTokenType.PropertyName)
+                {
+                    throw new JsonException();
+                }
+
+                return _converter.ReadAsPropertyName(ref utf8Reader, typeof(T), _options);
             }
-
-            var utf8Reader = new Utf8JsonReader(buffer.WrittenSpan);
-
-            if (!utf8Reader.Read() || utf8Reader.TokenType != JsonTokenType.StartObject)
+            finally
             {
-                throw new JsonException();
+                bridge.Return();
             }
-
-            if (!utf8Reader.Read() || utf8Reader.TokenType != JsonTokenType.PropertyName)
-            {
-                throw new JsonException();
-            }
-
-            return _converter.ReadAsPropertyName(ref utf8Reader, typeof(T), _options);
         }
 
         public override void WriteAsPropertyName(DataWriter writer, T value)
@@ -91,48 +138,79 @@ public sealed class JsonConverterAdapter : DataConverterFactory
                 throw new JsonException();
             }
 
-            var buffer = new ArrayBufferWriter<byte>();
-
-            using (var utf8Writer = new Utf8JsonWriter(buffer))
+            var bridge = Bridge.Rent();
+            try
             {
+                var utf8Writer = bridge.Writer;
                 utf8Writer.WriteStartObject();
                 _converter.WriteAsPropertyName(utf8Writer, value, _options);
                 utf8Writer.WriteNullValue();
                 utf8Writer.WriteEndObject();
+                utf8Writer.Flush();
+
+                var utf8Reader = new Utf8JsonReader(bridge.Buffer.WrittenSpan);
+
+                if (!utf8Reader.Read() || utf8Reader.TokenType != JsonTokenType.StartObject)
+                {
+                    throw new JsonException();
+                }
+
+                if (!utf8Reader.Read() || utf8Reader.TokenType != JsonTokenType.PropertyName)
+                {
+                    throw new JsonException();
+                }
+
+                writer.WriteString(utf8Reader.GetString() ?? throw new JsonException());
             }
-
-            var utf8Reader = new Utf8JsonReader(buffer.WrittenSpan);
-
-            if (!utf8Reader.Read() || utf8Reader.TokenType != JsonTokenType.StartObject)
+            finally
             {
-                throw new JsonException();
+                bridge.Return();
             }
-
-            if (!utf8Reader.Read() || utf8Reader.TokenType != JsonTokenType.PropertyName)
-            {
-                throw new JsonException();
-            }
-
-            writer.WriteString(utf8Reader.GetString() ?? throw new JsonException());
         }
 
         public override T? Read(in DataReader reader, uint tokenId, T? existingValue)
         {
-            var json = Json.JsonDocument.Encode(reader.ReadElement(tokenId));
-
-            var utf8Reader = new Utf8JsonReader(json);
-
-            if (!utf8Reader.Read())
+            var bridge = Bridge.Rent();
+            try
             {
-                return default;
-            }
+                // Scalars do not need a second REDox writer and its streaming buffer.
+                switch (reader.GetToken(tokenId).Kind)
+                {
+                    case DTokenKind.String:
+                    case DTokenKind.Symbol:
+                        bridge.Writer.WriteStringValue(reader.ReadUtf8String(tokenId));
+                        bridge.Writer.Flush();
+                        break;
+                    case DTokenKind.Boolean:
+                        bridge.Writer.WriteBooleanValue(reader.ReadBoolean(tokenId));
+                        bridge.Writer.Flush();
+                        break;
+                    case DTokenKind.Null:
+                        bridge.Writer.WriteNullValue();
+                        bridge.Writer.Flush();
+                        break;
+                    default:
+                        Json.JsonDocument.EncodeTo(reader.ReadElement(tokenId), bridge.Buffer);
+                        break;
+                }
+                var utf8Reader = new Utf8JsonReader(bridge.Buffer.WrittenSpan);
 
-            if (utf8Reader.TokenType == JsonTokenType.Null && !_converter.HandleNull)
+                if (!utf8Reader.Read())
+                {
+                    return default;
+                }
+
+                if (utf8Reader.TokenType == JsonTokenType.Null && !_converter.HandleNull)
+                {
+                    return default;
+                }
+
+                return _converter.Read(ref utf8Reader, typeof(T), _options);
+            }
+            finally
             {
-                return default;
+                bridge.Return();
             }
-
-            return _converter.Read(ref utf8Reader, typeof(T), _options);
         }
 
         public override void Write(DataWriter writer, T? value)
@@ -143,16 +221,85 @@ public sealed class JsonConverterAdapter : DataConverterFactory
                 return;
             }
 
-            var buffer = new ArrayBufferWriter<byte>();
-
-            using (var utf8Writer = new Utf8JsonWriter(buffer))
+            var bridge = Bridge.Rent();
+            try
             {
-                _converter.Write(utf8Writer, value!, _options);
+                _converter.Write(bridge.Writer, value!, _options);
+                bridge.Writer.Flush();
+                var utf8Reader = new Utf8JsonReader(bridge.Buffer.WrittenSpan);
+                if (!utf8Reader.Read())
+                {
+                    throw new JsonException();
+                }
+
+                if (utf8Reader.TokenType != JsonTokenType.StartObject &&
+                    utf8Reader.TokenType != JsonTokenType.StartArray)
+                {
+                    var end = utf8Reader;
+                    if (end.Read())
+                    {
+                        throw new JsonException();
+                    }
+                    WriteScalar(writer, ref utf8Reader);
+                    return;
+                }
+
+                using var document = JsonDocument.Parse(bridge.Buffer.WrittenMemory);
+                s_elementConverter.Write(writer, document.RootElement);
             }
+            finally
+            {
+                bridge.Return();
+            }
+        }
 
-            using var document = JsonDocument.Parse(buffer.WrittenMemory);
-
-            s_elementConverter.Write(writer, document.RootElement);
+        private static void WriteScalar(DataWriter writer, ref Utf8JsonReader reader)
+        {
+            switch (reader.TokenType)
+            {
+                case JsonTokenType.Null:
+                    writer.WriteNull();
+                    break;
+                case JsonTokenType.True:
+                case JsonTokenType.False:
+                    writer.WriteBoolean(reader.GetBoolean());
+                    break;
+                case JsonTokenType.Number:
+                    if (reader.TryGetInt64(out var integer))
+                    {
+                        writer.WriteInt64(integer);
+                    }
+                    else
+                    {
+                        writer.WriteBigNumber(reader.ValueSpan);
+                    }
+                    break;
+                case JsonTokenType.String:
+                    if (!reader.ValueIsEscaped)
+                    {
+                        writer.WriteString(reader.ValueSpan);
+                        break;
+                    }
+                    byte[]? rented = null;
+                    Span<byte> text = reader.ValueSpan.Length <= 256
+                        ? stackalloc byte[256]
+                        : (rented = ArrayPool<byte>.Shared.Rent(reader.ValueSpan.Length));
+                    try
+                    {
+                        var length = reader.CopyString(text);
+                        writer.WriteString(text.Slice(0, length));
+                    }
+                    finally
+                    {
+                        if (rented != null)
+                        {
+                            ArrayPool<byte>.Shared.Return(rented, clearArray: true);
+                        }
+                    }
+                    break;
+                default:
+                    throw new JsonException();
+            }
         }
     }
 }

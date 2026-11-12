@@ -6,6 +6,7 @@
     </PropertyGroup>
 
     <ItemGroup>
+        <ProjectReference Include="..\..\src\REDox.Serialization.SystemTextJson\REDox.Serialization.SystemTextJson.csproj" />
         <PackageReference Include="BenchmarkDotNet" Version="0.15.8" />
         <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
         <PackageReference Include="Utf8Json" Version="1.3.7" />
