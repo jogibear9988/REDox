@@ -455,6 +455,16 @@ var stjSettings = new SystemTextJsonSerializerSettings(new System.Text.Json.Json
 });
 ```
 
+The System.Text.Json adapter rejects unsupported contract and validation settings when
+constructed. `RespectRequiredConstructorParameters = true`, `RespectNullableAnnotations = true`,
+`AllowDuplicateProperties = false`, and `AllowOutOfOrderMetadataProperties = true` throw
+`NotSupportedException`. Custom `TypeInfoResolver` implementations, resolver chains, source-generated
+contracts, and reflection resolvers with modifiers are also rejected; an unmodified
+`DefaultJsonTypeInfoResolver` is accepted. Call
+`SystemTextJsonSerializerSettings.ValidateOptions(options)` to check these settings before migration.
+This check covers these contract and validation options, not complete STJ compatibility.
+The adapter snapshots and freezes the supplied options; construct new settings to apply later changes.
+
 #### Newtonsoft.Json
 
 ```csharp

@@ -10,6 +10,7 @@ using System.Runtime.CompilerServices;
 using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.Json.Serialization.Metadata;
 using REDox.Serialization.Converters;
 using REDox.Serialization.Metadata;
 
@@ -59,15 +60,12 @@ public class SystemTextJsonSerializerSettings : SerializerSettings
     public SystemTextJsonSerializerSettings(JsonSerializerOptions? options = null)
     {
         options = options ?? JsonSerializerOptions.Default;
+        ValidateOptions(options);
+        // Keep the validated contract stable even if the caller later changes its options.
+        options = new JsonSerializerOptions(options);
+        options.TypeInfoResolver = new DefaultJsonTypeInfoResolver();
+        options.MakeReadOnly(populateMissingResolver: true);
         _options = options;
-
-        //Not implement
-        //options.RespectNullableAnnotations
-        //options.RespectRequiredConstructorParameters
-        //options.TypeInfoResolver
-        //options.TypeInfoResolverChain
-        //options.AllowDuplicateProperties
-        //options.AllowOutOfOrderMetadataProperties
 
         var nullValue = NullValueHandling.Include;
         var defaultValue = DefaultValueHandling.Include;
@@ -169,6 +167,45 @@ public class SystemTextJsonSerializerSettings : SerializerSettings
     }
 
     public JsonUnknownTypeHandling UnknownTypeHandling { get; init; }
+
+    /// <summary>Checks options that the compatibility adapter cannot honor.</summary>
+    /// <exception cref="NotSupportedException">An unsupported contract or validation option is configured.</exception>
+    public static void ValidateOptions(JsonSerializerOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+
+        if (options.RespectNullableAnnotations)
+        {
+            throw UnsupportedOption(nameof(options.RespectNullableAnnotations));
+        }
+        if (options.RespectRequiredConstructorParameters)
+        {
+            throw UnsupportedOption(nameof(options.RespectRequiredConstructorParameters));
+        }
+        if (!options.AllowDuplicateProperties)
+        {
+            throw UnsupportedOption(nameof(options.AllowDuplicateProperties));
+        }
+        if (options.AllowOutOfOrderMetadataProperties)
+        {
+            throw UnsupportedOption(nameof(options.AllowOutOfOrderMetadataProperties));
+        }
+
+        var resolver = options.TypeInfoResolver;
+        if (resolver != null &&
+            (resolver.GetType() != typeof(DefaultJsonTypeInfoResolver) ||
+             ((DefaultJsonTypeInfoResolver)resolver).Modifiers.Count != 0))
+        {
+            throw UnsupportedOption(nameof(options.TypeInfoResolver));
+        }
+    }
+
+    private static NotSupportedException UnsupportedOption(string name)
+    {
+        return new NotSupportedException(
+            $"SystemTextJsonSerializerSettings does not support JsonSerializerOptions.{name}. " +
+            "Use System.Text.Json directly for this setting.");
+    }
 
     protected internal override ReferenceResolver CreateReferenceResolver()
     {
