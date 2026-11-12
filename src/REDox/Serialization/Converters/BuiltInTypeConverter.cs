@@ -2224,7 +2224,7 @@ sealed class BuiltInTypeConverter : DataConverterFactory
 
                 if (handling == UnknownObjectTypeHandling.Dictionary)
                 {
-                    var dict = new Dictionary<string, object?>();
+                    var dict = new Dictionary<string, object?>(reader.GetValueCount(tokenId));
 
                     foreach (var kv in reader.EnumerateMap(tokenId))
                     {
